@@ -3,7 +3,8 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use csv_to_sqlite::{
-    load_table_into_db, read_csv_table, run_query, table_name_from_path, IfExists, OutputFormat,
+    create_index, load_table_into_db, read_csv_table, run_query, table_name_from_path, IfExists,
+    OutputFormat,
 };
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -39,6 +40,12 @@ struct Cli {
     /// CSV has no header row; synthesize columns col1..colN.
     #[arg(long = "no-header", action = clap::ArgAction::SetTrue)]
     no_header: bool,
+
+    /// Create an index on the given column(s) after loading. Repeatable; a
+    /// value may be a comma-separated list of columns for a composite index
+    /// (e.g. --index region --index "year,month").
+    #[arg(long = "index", value_name = "COL[,COL...]")]
+    index: Vec<String>,
 
     /// Run this SQL query after loading (or on --db) and print results.
     #[arg(long = "query", value_name = "SQL")]
@@ -144,6 +151,37 @@ fn run() -> Result<()> {
             eprintln!(
                 "Loaded {n} row(s) into table \"{table_name}\" ({} column(s))",
                 loaded.columns.len()
+            );
+        }
+    }
+
+    // Create any requested indexes (after loading, before querying so the
+    // query planner can use them).
+    if !cli.index.is_empty() {
+        let table_name = match (&cli.table, cli.inputs.len()) {
+            (Some(name), _) => name.clone(),
+            (None, 1) => table_name_from_path(&cli.inputs[0]),
+            (None, 0) => {
+                bail!("--index requires --table to name the target table when not loading a CSV")
+            }
+            (None, _) => {
+                bail!("--index requires --table to pick which table to index when loading multiple files")
+            }
+        };
+        for spec in &cli.index {
+            let cols: Vec<String> = spec
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if cols.is_empty() {
+                bail!("--index requires at least one column name (got {spec:?})");
+            }
+            let idx = create_index(&conn, &table_name, &cols)
+                .with_context(|| format!("indexing table {table_name}"))?;
+            eprintln!(
+                "Created index \"{idx}\" on \"{table_name}\" ({})",
+                cols.join(", ")
             );
         }
     }

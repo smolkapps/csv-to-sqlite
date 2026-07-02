@@ -371,6 +371,61 @@ fn insert_rows(conn: &mut Connection, table: &LoadedTable) -> Result<usize> {
     Ok(inserted)
 }
 
+/// Sanitize a string into a component safe to embed in a generated identifier
+/// (used to build index names): non-alphanumerics become `_`. Never empty.
+fn sanitize_ident_part(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        "_".to_string()
+    } else {
+        out
+    }
+}
+
+/// Derive a deterministic index name from a table and its columns, e.g.
+/// `idx_people_name` or `idx_people_name_price` for a composite index.
+fn index_name(table: &str, columns: &[String]) -> String {
+    let mut parts = vec![sanitize_ident_part(table)];
+    parts.extend(columns.iter().map(|c| sanitize_ident_part(c)));
+    format!("idx_{}", parts.join("_"))
+}
+
+/// Create an index on one or more `columns` of `table`.
+///
+/// Identifiers are quoted (so column names with spaces/punctuation work) and
+/// the statement uses `IF NOT EXISTS`, making repeated runs idempotent. Returns
+/// the generated index name. Passing multiple columns creates a single
+/// composite index over them, in order.
+pub fn create_index(conn: &Connection, table: &str, columns: &[String]) -> Result<String> {
+    if columns.is_empty() {
+        bail!("cannot create an index with no columns");
+    }
+    let idx_name = index_name(table, columns);
+    let col_list = columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+        quote_ident(&idx_name),
+        quote_ident(table),
+        col_list
+    );
+    conn.execute(&sql, [])
+        .with_context(|| format!("creating index on {}({})", table, columns.join(", ")))?;
+    Ok(idx_name)
+}
+
 /// Does a table with this name exist in the main schema?
 pub fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     let count: i64 = conn.query_row(
@@ -565,6 +620,20 @@ mod tests {
         assert_eq!(
             ddl,
             r#"CREATE TABLE "people" ("id" INTEGER, "full name" TEXT)"#
+        );
+    }
+
+    #[test]
+    fn index_names_are_derived_and_sanitized() {
+        assert_eq!(index_name("people", &["name".into()]), "idx_people_name");
+        assert_eq!(
+            index_name("people", &["name".into(), "price".into()]),
+            "idx_people_name_price"
+        );
+        // Non-alphanumeric characters in the table/column collapse to `_`.
+        assert_eq!(
+            index_name("my table", &["full name".into()]),
+            "idx_my_table_full_name"
         );
     }
 

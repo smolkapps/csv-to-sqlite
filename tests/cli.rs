@@ -235,6 +235,96 @@ fn custom_delimiter_via_cli() {
 }
 
 #[test]
+fn create_index_via_cli() {
+    let dir = TempDir::new().unwrap();
+    let csv = write_csv(dir.path(), "people.csv", PEOPLE_CSV);
+    let db = dir.path().join("out.db");
+
+    // Load and build one single-column and one composite index.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg(&csv)
+        .arg("-o")
+        .arg(&db)
+        .arg("--index")
+        .arg("name")
+        .arg("--index")
+        .arg("id,price")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Created index \"idx_people_name\"",
+        ))
+        .stderr(predicate::str::contains(
+            "Created index \"idx_people_id_price\"",
+        ));
+
+    // Both indexes must be present in the resulting database.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg("--db")
+        .arg(&db)
+        .arg("--query")
+        .arg("SELECT name FROM sqlite_master WHERE type='index' ORDER BY name")
+        .arg("--format")
+        .arg("csv")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("idx_people_id_price"))
+        .stdout(predicate::str::contains("idx_people_name"));
+}
+
+#[test]
+fn index_on_existing_db_with_table() {
+    let dir = TempDir::new().unwrap();
+    let csv = write_csv(dir.path(), "people.csv", PEOPLE_CSV);
+    let db = dir.path().join("out.db");
+
+    // Load first, without indexing.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg(&csv)
+        .arg("-o")
+        .arg(&db)
+        .assert()
+        .success();
+
+    // Index an existing database; --table names the target.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg("--db")
+        .arg(&db)
+        .arg("--table")
+        .arg("people")
+        .arg("--index")
+        .arg("price")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("idx_people_price"));
+}
+
+#[test]
+fn index_requires_table_for_multiple_inputs() {
+    let dir = TempDir::new().unwrap();
+    let people = write_csv(dir.path(), "people.csv", PEOPLE_CSV);
+    let orders = write_csv(dir.path(), "orders.csv", "order_id,amount\n100,3\n");
+    let db = dir.path().join("out.db");
+
+    // Ambiguous which table to index across two files -> clean error.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg(&people)
+        .arg(&orders)
+        .arg("-o")
+        .arg(&db)
+        .arg("--index")
+        .arg("id")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--index requires --table"));
+}
+
+#[test]
 fn missing_db_arg_errors() {
     let dir = TempDir::new().unwrap();
     let csv = write_csv(dir.path(), "people.csv", PEOPLE_CSV);

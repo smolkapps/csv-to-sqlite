@@ -2,8 +2,8 @@
 //! SQLite database and assert row counts, inferred types, and query results.
 
 use csv_to_sqlite::{
-    create_table_ddl, load_table_into_db, read_csv_table, run_query, ColType, IfExists,
-    OutputFormat,
+    create_index, create_table_ddl, load_table_into_db, read_csv_table, run_query, ColType,
+    IfExists, OutputFormat,
 };
 use rusqlite::Connection;
 use std::io::Write;
@@ -290,6 +290,54 @@ fn loads_into_a_real_db_file_on_disk() {
         .query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 3);
+}
+
+#[test]
+fn create_index_single_column() {
+    let f = csv_file(PEOPLE_CSV);
+    let table = read_csv_table(Path::new(f.path()), "people", b',', true).unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    load_table_into_db(&mut conn, &table, IfExists::Fail).unwrap();
+
+    let idx = create_index(&conn, "people", &["name".to_string()]).unwrap();
+    assert_eq!(idx, "idx_people_name");
+
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_people_name'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(exists, 1);
+}
+
+#[test]
+fn create_index_composite_and_idempotent() {
+    let f = csv_file(PEOPLE_CSV);
+    let table = read_csv_table(Path::new(f.path()), "people", b',', true).unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    load_table_into_db(&mut conn, &table, IfExists::Fail).unwrap();
+
+    let cols = vec!["name".to_string(), "price".to_string()];
+    let idx = create_index(&conn, "people", &cols).unwrap();
+    assert_eq!(idx, "idx_people_name_price");
+
+    // Re-creating the same index is a no-op (IF NOT EXISTS), not an error.
+    let idx2 = create_index(&conn, "people", &cols).unwrap();
+    assert_eq!(idx2, "idx_people_name_price");
+
+    // The index really covers both columns, in order.
+    let indexed_cols: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_index_info('idx_people_name_price') ORDER BY seqno")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect()
+    };
+    assert_eq!(indexed_cols, vec!["name", "price"]);
 }
 
 #[test]

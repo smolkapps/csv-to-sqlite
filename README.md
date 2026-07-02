@@ -13,6 +13,8 @@ inference and a built-in query runner. A single, dependency-light Rust CLI.
 - **One table per file** — pass several CSVs and each lands in its own table.
 - **Query runner** — run a `SELECT` after loading (or against an existing
   database) and print results as an ASCII table or CSV.
+- **Index creation** — add one or more indexes after loading with `--index`,
+  including composite indexes, to speed up later queries.
 
 ## Install / build
 
@@ -39,6 +41,7 @@ Options:
       --if-exists <WHAT>  replace | append | fail   [default: fail]
       --delim <CHAR>      Field delimiter (use \t for tab)   [default: ,]
       --no-header         CSV has no header; synthesize col1..colN
+      --index <COL,...>   Index column(s) after loading (repeatable; composite)
       --query <SQL>       Run a query after loading and print results
       --format <FMT>      csv | table   [default: table]
   -h, --help              Print help
@@ -70,6 +73,20 @@ Append more rows to an existing table:
 
 ```sh
 csv-to-sqlite more_sales.csv -o shop.db --table sales --if-exists append
+```
+
+Load and build indexes to speed up later lookups (repeat `--index` for more;
+comma-separate columns for a composite index):
+
+```sh
+csv-to-sqlite sales.csv -o shop.db --table sales \
+  --index region --index "year,month"
+```
+
+Index an already-loaded table (name it with `--table`):
+
+```sh
+csv-to-sqlite --db shop.db --table sales --index region
 ```
 
 Query an existing database without loading anything, as CSV:
