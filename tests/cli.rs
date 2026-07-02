@@ -325,6 +325,143 @@ fn index_requires_table_for_multiple_inputs() {
 }
 
 #[test]
+fn index_missing_column_errors_cleanly() {
+    let dir = TempDir::new().unwrap();
+    let csv = write_csv(dir.path(), "people.csv", PEOPLE_CSV);
+    let db = dir.path().join("out.db");
+
+    // A typo'd column must fail cleanly and must NOT report a created index.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg(&csv)
+        .arg("-o")
+        .arg(&db)
+        .arg("--index")
+        .arg("nope")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no such column"))
+        .stderr(predicate::str::contains("Created index").not());
+
+    // No index was actually created.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg("--db")
+        .arg(&db)
+        .arg("--query")
+        .arg("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='index'")
+        .arg("--format")
+        .arg("csv")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("n\n0"));
+}
+
+#[test]
+fn index_name_collision_same_table_errors() {
+    let dir = TempDir::new().unwrap();
+    // "x_y" (single) and "x,y" (composite) both derive idx_t_x_y.
+    let csv = write_csv(dir.path(), "t.csv", "x_y,x,y\n1,2,3\n4,5,6\n");
+    let db = dir.path().join("out.db");
+
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg(&csv)
+        .arg("-o")
+        .arg(&db)
+        .arg("--index")
+        .arg("x_y")
+        .arg("--index")
+        .arg("x,y")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("collides").or(predicate::str::contains("already exists")),
+        );
+}
+
+#[test]
+fn index_name_collision_cross_table_errors() {
+    let dir = TempDir::new().unwrap();
+    // Table "a" col "b_c" and table "a_b" col "c" both derive idx_a_b_c.
+    let a = write_csv(dir.path(), "a.csv", "b_c\n1\n2\n");
+    let a_b = write_csv(dir.path(), "a_b.csv", "c\n1\n2\n");
+    let db = dir.path().join("out.db");
+
+    // Load both tables (no indexing yet).
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg(&a)
+        .arg(&a_b)
+        .arg("-o")
+        .arg(&db)
+        .assert()
+        .success();
+
+    // Index table "a" on b_c -> idx_a_b_c.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg("--db")
+        .arg(&db)
+        .arg("--table")
+        .arg("a")
+        .arg("--index")
+        .arg("b_c")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Created index \"idx_a_b_c\""));
+
+    // Index table "a_b" on c -> same derived name, different index -> error.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg("--db")
+        .arg(&db)
+        .arg("--table")
+        .arg("a_b")
+        .arg("--index")
+        .arg("c")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("collides").or(predicate::str::contains("already exists")))
+        .stderr(predicate::str::contains("Created index").not());
+}
+
+#[test]
+fn index_already_exists_does_not_print_created() {
+    let dir = TempDir::new().unwrap();
+    let csv = write_csv(dir.path(), "people.csv", PEOPLE_CSV);
+    let db = dir.path().join("out.db");
+
+    // First run creates the index.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg(&csv)
+        .arg("-o")
+        .arg(&db)
+        .arg("--index")
+        .arg("name")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Created index \"idx_people_name\"",
+        ));
+
+    // Second run on the existing DB must NOT claim it created the index.
+    Command::cargo_bin("csv-to-sqlite")
+        .unwrap()
+        .arg("--db")
+        .arg(&db)
+        .arg("--table")
+        .arg("people")
+        .arg("--index")
+        .arg("name")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Created index").not())
+        .stderr(predicate::str::contains("already exists"));
+}
+
+#[test]
 fn missing_db_arg_errors() {
     let dir = TempDir::new().unwrap();
     let csv = write_csv(dir.path(), "people.csv", PEOPLE_CSV);

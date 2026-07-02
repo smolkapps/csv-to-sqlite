@@ -3,8 +3,8 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use csv_to_sqlite::{
-    create_index, load_table_into_db, read_csv_table, run_query, table_name_from_path, IfExists,
-    OutputFormat,
+    create_index, harden_connection, load_table_into_db, read_csv_table, run_query,
+    table_name_from_path, IfExists, IndexOutcome, OutputFormat,
 };
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -137,6 +137,10 @@ fn run() -> Result<()> {
         bail!("must specify an output database with -o DB (to load) or --db DB (to query)");
     };
 
+    // Disable SQLite's double-quoted-string-literal misfeature so a typo'd
+    // column name is an error, not a silently constant index.
+    harden_connection(&conn)?;
+
     // Load each input CSV as its own table.
     if cli.db.is_none() {
         for input in &cli.inputs {
@@ -177,12 +181,18 @@ fn run() -> Result<()> {
             if cols.is_empty() {
                 bail!("--index requires at least one column name (got {spec:?})");
             }
-            let idx = create_index(&conn, &table_name, &cols)
+            let (idx, outcome) = create_index(&conn, &table_name, &cols)
                 .with_context(|| format!("indexing table {table_name}"))?;
-            eprintln!(
-                "Created index \"{idx}\" on \"{table_name}\" ({})",
-                cols.join(", ")
-            );
+            match outcome {
+                IndexOutcome::Created => eprintln!(
+                    "Created index \"{idx}\" on \"{table_name}\" ({})",
+                    cols.join(", ")
+                ),
+                IndexOutcome::AlreadyExists => eprintln!(
+                    "Index \"{idx}\" already exists on \"{table_name}\" ({}); skipping",
+                    cols.join(", ")
+                ),
+            }
         }
     }
 
