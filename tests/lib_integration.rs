@@ -2,8 +2,8 @@
 //! SQLite database and assert row counts, inferred types, and query results.
 
 use csv_to_sqlite::{
-    create_table_ddl, load_table_into_db, read_csv_table, run_query, ColType, IfExists,
-    OutputFormat,
+    create_index, create_table_ddl, harden_connection, load_table_into_db, read_csv_table,
+    run_query, ColType, IfExists, IndexOutcome, OutputFormat,
 };
 use rusqlite::Connection;
 use std::io::Write;
@@ -290,6 +290,143 @@ fn loads_into_a_real_db_file_on_disk() {
         .query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 3);
+}
+
+#[test]
+fn create_index_single_column() {
+    let f = csv_file(PEOPLE_CSV);
+    let table = read_csv_table(Path::new(f.path()), "people", b',', true).unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    load_table_into_db(&mut conn, &table, IfExists::Fail).unwrap();
+
+    let (idx, outcome) = create_index(&conn, "people", &["name".to_string()]).unwrap();
+    assert_eq!(idx, "idx_people_name");
+    assert_eq!(outcome, IndexOutcome::Created);
+
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_people_name'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(exists, 1);
+}
+
+#[test]
+fn create_index_composite_and_idempotent() {
+    let f = csv_file(PEOPLE_CSV);
+    let table = read_csv_table(Path::new(f.path()), "people", b',', true).unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    load_table_into_db(&mut conn, &table, IfExists::Fail).unwrap();
+
+    let cols = vec!["name".to_string(), "price".to_string()];
+    let (idx, outcome) = create_index(&conn, "people", &cols).unwrap();
+    assert_eq!(idx, "idx_people_name_price");
+    assert_eq!(outcome, IndexOutcome::Created);
+
+    // Re-creating the same index is a no-op, reported as AlreadyExists.
+    let (idx2, outcome2) = create_index(&conn, "people", &cols).unwrap();
+    assert_eq!(idx2, "idx_people_name_price");
+    assert_eq!(outcome2, IndexOutcome::AlreadyExists);
+
+    // The index really covers both columns, in order.
+    let indexed_cols: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_index_info('idx_people_name_price') ORDER BY seqno")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect()
+    };
+    assert_eq!(indexed_cols, vec!["name", "price"]);
+}
+
+#[test]
+fn create_index_on_missing_column_errors() {
+    let f = csv_file(PEOPLE_CSV);
+    let table = read_csv_table(Path::new(f.path()), "people", b',', true).unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    harden_connection(&conn).unwrap();
+    load_table_into_db(&mut conn, &table, IfExists::Fail).unwrap();
+
+    // A typo'd / nonexistent column must be a hard error, not a silently
+    // constant index reported as success.
+    let err = create_index(&conn, "people", &["nope".to_string()]).unwrap_err();
+    assert!(
+        err.to_string().contains("no such column"),
+        "unexpected error: {err}"
+    );
+
+    // And nothing was created.
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn same_table_name_collision_errors() {
+    // Columns "x_y" (single) and ["x","y"] (composite) both derive the name
+    // idx_t_x_y; the second request must error rather than silently no-op.
+    let f = csv_file("x_y,x,y\n1,2,3\n");
+    let table = read_csv_table(Path::new(f.path()), "t", b',', true).unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    harden_connection(&conn).unwrap();
+    load_table_into_db(&mut conn, &table, IfExists::Fail).unwrap();
+
+    let (idx, outcome) = create_index(&conn, "t", &["x_y".to_string()]).unwrap();
+    assert_eq!(idx, "idx_t_x_y");
+    assert_eq!(outcome, IndexOutcome::Created);
+
+    let err = create_index(&conn, "t", &["x".to_string(), "y".to_string()]).unwrap_err();
+    assert!(
+        err.to_string().contains("collides") || err.to_string().contains("already exists"),
+        "unexpected error: {err}"
+    );
+
+    // The original single-column index is intact and is the only one present.
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect()
+    };
+    assert_eq!(names, vec!["idx_t_x_y".to_string()]);
+}
+
+#[test]
+fn cross_table_name_collision_errors() {
+    // Table "a" col "b_c" and table "a_b" col "c" both derive idx_a_b_c.
+    let mut conn = Connection::open_in_memory().unwrap();
+    harden_connection(&conn).unwrap();
+
+    let a = csv_file("b_c\n1\n2\n");
+    let t_a = read_csv_table(Path::new(a.path()), "a", b',', true).unwrap();
+    load_table_into_db(&mut conn, &t_a, IfExists::Fail).unwrap();
+
+    let a_b = csv_file("c\n1\n2\n");
+    let t_a_b = read_csv_table(Path::new(a_b.path()), "a_b", b',', true).unwrap();
+    load_table_into_db(&mut conn, &t_a_b, IfExists::Fail).unwrap();
+
+    let (idx, outcome) = create_index(&conn, "a", &["b_c".to_string()]).unwrap();
+    assert_eq!(idx, "idx_a_b_c");
+    assert_eq!(outcome, IndexOutcome::Created);
+
+    // Same derived name, different (table, columns): must error, not no-op.
+    let err = create_index(&conn, "a_b", &["c".to_string()]).unwrap_err();
+    assert!(
+        err.to_string().contains("collides") || err.to_string().contains("already exists"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

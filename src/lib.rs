@@ -5,7 +5,7 @@
 //! results are rendered back as CSV or an ASCII table.
 
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{types::Value, Connection};
+use rusqlite::{types::Value, Connection, OptionalExtension};
 use std::path::Path;
 
 /// SQLite storage class we infer for a column.
@@ -36,6 +36,24 @@ pub enum IfExists {
     Replace,
     /// Keep the table and append rows (header must match column count).
     Append,
+}
+
+/// Harden a freshly opened [`Connection`] against SQLite's "double-quoted
+/// string literal" misfeature (DQS), in both DDL and DML contexts.
+///
+/// With DQS enabled (SQLite's historical default), a double-quoted token that
+/// doesn't resolve to a real identifier is silently reinterpreted as a string
+/// literal instead of raising an error. That turns a typo'd or nonexistent
+/// column name in `CREATE INDEX ... ("nope")` into a constant string literal,
+/// building a useless index over a fixed value while the tool reports success.
+/// Disabling DQS makes such mistakes hard errors. Call this immediately after
+/// every `Connection::open*`.
+pub fn harden_connection(conn: &Connection) -> Result<()> {
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)
+        .context("disabling double-quoted string literals for DDL")?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML, false)
+        .context("disabling double-quoted string literals for DML")?;
+    Ok(())
 }
 
 /// Treat a single CSV field as empty (=> NULL / ignored for inference).
@@ -371,6 +389,165 @@ fn insert_rows(conn: &mut Connection, table: &LoadedTable) -> Result<usize> {
     Ok(inserted)
 }
 
+/// Sanitize a string into a component safe to embed in a generated identifier
+/// (used to build index names): non-alphanumerics become `_`. Never empty.
+fn sanitize_ident_part(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        "_".to_string()
+    } else {
+        out
+    }
+}
+
+/// Derive a deterministic index name from a table and its columns, e.g.
+/// `idx_people_name` or `idx_people_name_price` for a composite index.
+fn index_name(table: &str, columns: &[String]) -> String {
+    let mut parts = vec![sanitize_ident_part(table)];
+    parts.extend(columns.iter().map(|c| sanitize_ident_part(c)));
+    format!("idx_{}", parts.join("_"))
+}
+
+/// Whether [`create_index`] actually created a new index or found an identical
+/// one already present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOutcome {
+    /// A new index was created.
+    Created,
+    /// An identical index (same table and columns) already existed; nothing
+    /// was created.
+    AlreadyExists,
+}
+
+/// An existing index's target table and indexed column list, as read back from
+/// the schema.
+struct ExistingIndex {
+    table: String,
+    columns: Vec<String>,
+}
+
+/// Case-insensitive comparison of two identifier lists (SQLite resolves table
+/// and column names case-insensitively).
+fn same_idents(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// Look up an existing index by name, returning the table it's on and its
+/// indexed columns, or `None` if no index with that name exists.
+fn existing_index(conn: &Connection, name: &str) -> Result<Option<ExistingIndex>> {
+    let tbl: Option<String> = conn
+        .query_row(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?1",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()
+        .context("looking up existing index")?;
+    let Some(table) = tbl else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(&format!("PRAGMA index_info({})", quote_ident(name)))?;
+    let columns: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, Option<String>>(2))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok(Some(ExistingIndex { table, columns }))
+}
+
+/// The column names of an existing table, in declaration order.
+fn table_columns(conn: &Connection, name: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_ident(name)))?;
+    let cols = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(cols)
+}
+
+/// Create an index on one or more `columns` of `table`.
+///
+/// Identifiers are quoted (so column names with spaces/punctuation work).
+/// Returns the generated index name and whether a new index was created or an
+/// identical one already existed. Passing multiple columns creates a single
+/// composite index over them, in order.
+///
+/// Two safety checks guard against silent no-ops that would otherwise report a
+/// false success:
+/// - every requested column must exist on `table` (otherwise we'd build an
+///   index over a nonexistent/typo'd column);
+/// - the derived index name is checked against the schema. Because
+///   [`index_name`] flattens the table/column boundary, distinct
+///   `(table, columns)` inputs can collapse to the same name; if a *different*
+///   index already owns that name we [`bail!`] with a collision error instead
+///   of issuing a `CREATE INDEX IF NOT EXISTS` that silently does nothing.
+pub fn create_index(
+    conn: &Connection,
+    table: &str,
+    columns: &[String],
+) -> Result<(String, IndexOutcome)> {
+    if columns.is_empty() {
+        bail!("cannot create an index with no columns");
+    }
+
+    // Validate the target table and every requested column up front, so a typo
+    // is a clear error rather than (with DQS) a constant-valued index.
+    if !table_exists(conn, table)? {
+        bail!("cannot index table \"{table}\": no such table");
+    }
+    let existing_cols = table_columns(conn, table)?;
+    for col in columns {
+        if !existing_cols.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+            bail!("cannot index \"{table}\": no such column \"{col}\"");
+        }
+    }
+
+    let idx_name = index_name(table, columns);
+
+    // Guard against derived-name collisions. If an index with this name already
+    // exists, either it is the very same index (idempotent no-op) or a distinct
+    // (table, columns) request collapsed onto the same name (a bug we must not
+    // paper over with a success message).
+    if let Some(existing) = existing_index(conn, &idx_name)? {
+        if existing.table.eq_ignore_ascii_case(table) && same_idents(&existing.columns, columns) {
+            return Ok((idx_name, IndexOutcome::AlreadyExists));
+        }
+        bail!(
+            "index name \"{}\" already exists on \"{}\"({}); refusing to create a \
+             different index on \"{}\"({}) whose derived name collides with it",
+            idx_name,
+            existing.table,
+            existing.columns.join(", "),
+            table,
+            columns.join(", ")
+        );
+    }
+
+    let col_list = columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "CREATE INDEX {} ON {} ({})",
+        quote_ident(&idx_name),
+        quote_ident(table),
+        col_list
+    );
+    conn.execute(&sql, [])
+        .with_context(|| format!("creating index on {}({})", table, columns.join(", ")))?;
+    Ok((idx_name, IndexOutcome::Created))
+}
+
 /// Does a table with this name exist in the main schema?
 pub fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     let count: i64 = conn.query_row(
@@ -565,6 +742,20 @@ mod tests {
         assert_eq!(
             ddl,
             r#"CREATE TABLE "people" ("id" INTEGER, "full name" TEXT)"#
+        );
+    }
+
+    #[test]
+    fn index_names_are_derived_and_sanitized() {
+        assert_eq!(index_name("people", &["name".into()]), "idx_people_name");
+        assert_eq!(
+            index_name("people", &["name".into(), "price".into()]),
+            "idx_people_name_price"
+        );
+        // Non-alphanumeric characters in the table/column collapse to `_`.
+        assert_eq!(
+            index_name("my table", &["full name".into()]),
+            "idx_my_table_full_name"
         );
     }
 
